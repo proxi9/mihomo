@@ -14,6 +14,10 @@ import (
 )
 
 func testInboundVless(t *testing.T, inboundOptions inbound.VlessOption, outboundOptions outbound.VlessOption) {
+	testInboundVlessWithMuxCool(t, inboundOptions, outboundOptions, false)
+}
+
+func testInboundVlessWithMuxCool(t *testing.T, inboundOptions inbound.VlessOption, outboundOptions outbound.VlessOption, runMuxCool bool) {
 	t.Parallel()
 	inboundOptions.BaseOption = inbound.BaseOption{
 		NameStr: "vless_inbound",
@@ -61,6 +65,13 @@ func testInboundVless(t *testing.T, inboundOptions inbound.VlessOption, outbound
 		return
 	}
 	testSingMux(t, tunnel, out)
+	if runMuxCool {
+		testMuxCool(t, tunnel, out)
+	}
+}
+
+func TestInboundVless_MuxCool(t *testing.T) {
+	testInboundVlessWithMuxCool(t, inbound.VlessOption{AllowInsecure: true}, outbound.VlessOption{}, true)
 }
 
 func testInboundVlessTLS(t *testing.T, inboundOptions inbound.VlessOption, outboundOptions outbound.VlessOption, testVision bool) {
