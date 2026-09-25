@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/log"
@@ -48,6 +49,12 @@ type RealityConfig struct {
 	SpiderY       [10]int64
 	Show          bool
 	KeyLogWriter  io.Writer
+
+	// legacyHello is set after the server rejected a Client Hello carrying
+	// X25519MLKEM768: REALITY servers before Xray 25 accept only the classic
+	// hello, Xray 26.9.8+ accept only the post-quantum one. The next dial to
+	// this proxy uses the other hello.
+	legacyHello atomic.Bool
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
@@ -71,6 +78,14 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 		err := uConn.BuildHandshakeState()
 		if err != nil {
 			return nil, err
+		}
+
+		legacy := realityConfig.legacyHello.Load()
+		switchable := helloHasX25519MLKEM768(uConn)
+		if legacy && switchable {
+			if err = BuildRemovedX25519MLKEM768HandshakeState(uConn); err != nil {
+				return nil, err
+			}
 		}
 
 		hello := uConn.HandshakeState.Hello
@@ -128,12 +143,18 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 
 		err = uConn.HandshakeContext(ctx)
 		if err != nil {
+			if verifier.sawCertificate && !verifier.verified && switchable {
+				realityConfig.switchHello(legacy, serverName)
+			}
 			return nil, err
 		}
 
 		log.Debugln("REALITY Authentication: %v, AEAD: %T", verifier.verified, aeadCipher)
 
 		if !verifier.verified {
+			if switchable {
+				realityConfig.switchHello(legacy, serverName)
+			}
 			go realityClientFallback(uConn, uConfig.ServerName, fingerprint, realityConfig.SpiderX, realityConfig.SpiderY)
 			time.Sleep(realityRandomDuration(realityConfig.SpiderY[8], realityConfig.SpiderY[9]))
 			return nil, errors.New("REALITY authentication failed")
@@ -281,13 +302,40 @@ func realitySetNavigationHeaders(request *http.Request, _ utls.ClientHelloID) {
 	request.Header.Set("Priority", "u=0, i")
 }
 
+func (c *RealityConfig) switchHello(legacy bool, serverName string) {
+	if c.legacyHello.CompareAndSwap(legacy, !legacy) {
+		log.Warnln("[REALITY] %s rejected the %s Client Hello, next dial uses the %s one", serverName, realityHelloName(legacy), realityHelloName(!legacy))
+	}
+}
+
+func realityHelloName(legacy bool) string {
+	if legacy {
+		return "classic"
+	}
+	return "X25519MLKEM768"
+}
+
+func helloHasX25519MLKEM768(c *UConn) bool {
+	for _, extension := range c.Extensions {
+		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+			for _, share := range ks.KeyShares {
+				if share.Group == utls.X25519MLKEM768 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 type realityVerifier struct {
 	*utls.UConn
-	serverName    string
-	authKey       []byte
-	mldsa65Verify []byte
-	verified      bool
-	show          bool
+	serverName     string
+	authKey        []byte
+	mldsa65Verify  []byte
+	sawCertificate bool
+	verified       bool
+	show           bool
 }
 
 func (c *realityVerifier) VerifyConnection(state utls.ConnectionState) error {
@@ -298,6 +346,7 @@ func (c *realityVerifier) VerifyConnection(state utls.ConnectionState) error {
 	if len(certs) == 0 {
 		return errors.New("REALITY server sent no certificate")
 	}
+	c.sawCertificate = true
 	if pub, ok := certs[0].PublicKey.(ed25519.PublicKey); ok {
 		h := hmac.New(sha512.New, c.authKey)
 		h.Write(pub)
