@@ -9,7 +9,9 @@ import (
 
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/muxcool"
+	"github.com/metacubex/mihomo/transport/vless"
 )
 
 const (
@@ -39,6 +41,11 @@ type MuxCool struct {
 	option    MuxCoolOption
 	closeOnce sync.Once
 	closeErr  error
+
+	// Xray serves only UDP over mux for a Vision user and rejects muxed TCP
+	// ("unexpected network TCP"); like Xray's client, TCP then goes straight
+	// through Vision and only UDP rides mux.cool as XUDP.
+	udpOnly bool
 }
 
 func NewMuxCool(option MuxCoolOption, proxy ProxyAdapter) (ProxyAdapter, error) {
@@ -69,6 +76,10 @@ func NewMuxCool(option MuxCoolOption, proxy ProxyAdapter) (ProxyAdapter, error) 
 	}
 
 	wrapper := &MuxCool{ProxyAdapter: proxy, option: option}
+	if v, ok := proxy.(*Vless); ok && v.option.Flow == vless.XRV {
+		wrapper.udpOnly = true
+		log.Warnln("[mux.cool] %s: flow %s, only UDP goes over mux.cool (as in Xray), TCP goes through Vision", proxy.Name(), vless.XRV)
+	}
 	var limiter *muxcool.CarrierLimiter
 	if option.MaxCarriers > 0 {
 		limiter = muxcool.NewCarrierLimiter(option.MaxCarriers)
@@ -103,7 +114,7 @@ func (x *MuxCool) dialCarrier(ctx context.Context) (net.Conn, error) {
 }
 
 func (x *MuxCool) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	if metadata.NetWork != C.TCP {
+	if metadata.NetWork != C.TCP || x.udpOnly {
 		return x.ProxyAdapter.DialContext(ctx, metadata)
 	}
 	conn, err := x.pool.DialContext(ctx, metadata.String(), metadata.DstPort)
