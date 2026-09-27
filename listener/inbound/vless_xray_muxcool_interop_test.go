@@ -21,7 +21,8 @@ import (
 )
 
 // TestVLESSMuxCoolXrayInterop sends parallel TCP streams and UDP (XUDP) through
-// the mux.cool client to a stock Xray-core VLESS+REALITY server.
+// the mux.cool client to a stock Xray-core VLESS+REALITY server, for a plain
+// user and for a Vision user (Xray muxes only UDP for Vision).
 func TestVLESSMuxCoolXrayInterop(t *testing.T) {
 	xrayBinary := os.Getenv("XRAY_BINARY")
 	if xrayBinary == "" {
@@ -38,7 +39,10 @@ func TestVLESSMuxCoolXrayInterop(t *testing.T) {
 		"inbounds": []any{map[string]any{
 			"listen": "127.0.0.1", "port": xrayPort.Port(), "protocol": "vless",
 			"settings": map[string]any{
-				"clients":    []any{map[string]any{"id": xrayRealityPlainUUID}},
+				"clients": []any{
+					map[string]any{"id": xrayRealityPlainUUID},
+					map[string]any{"id": xrayRealityVisionUUID, "flow": "xtls-rprx-vision"},
+				},
 				"decryption": "none",
 			},
 			"streamSettings": map[string]any{
@@ -59,88 +63,96 @@ func TestVLESSMuxCoolXrayInterop(t *testing.T) {
 	require.NoError(t, err)
 	startXrayRealityServer(t, xrayBinary, config, xrayPort)
 
-	vless, err := outbound.NewVless(outbound.VlessOption{
-		Name:              "vless_muxcool_xray",
-		Server:            "127.0.0.1",
-		Port:              xrayPort.Port(),
-		UUID:              xrayRealityPlainUUID,
-		TLS:               true,
-		UDP:               true,
-		ServerName:        "localhost",
-		ClientFingerprint: "chrome",
-		RealityOpts: outbound.RealityOptions{
-			PublicKey: base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()),
-			ShortID:   xrayRealityShortID,
-		},
-	})
-	require.NoError(t, err)
-	out, err := outbound.NewMuxCool(outbound.MuxCoolOption{Enabled: true}, vless)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = out.Close() })
+	for _, user := range []struct{ name, uuid, flow string }{
+		{"plain", xrayRealityPlainUUID, ""},
+		{"vision", xrayRealityVisionUUID, "xtls-rprx-vision"},
+	} {
+		t.Run(user.name, func(t *testing.T) {
+			vless, err := outbound.NewVless(outbound.VlessOption{
+				Name:              "vless_muxcool_xray",
+				Server:            "127.0.0.1",
+				Port:              xrayPort.Port(),
+				UUID:              user.uuid,
+				Flow:              user.flow,
+				TLS:               true,
+				UDP:               true,
+				ServerName:        "localhost",
+				ClientFingerprint: "chrome",
+				RealityOpts: outbound.RealityOptions{
+					PublicKey: base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()),
+					ShortID:   xrayRealityShortID,
+				},
+			})
+			require.NoError(t, err)
+			out, err := outbound.NewMuxCool(outbound.MuxCoolOption{Enabled: true}, vless)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = out.Close() })
 
-	// Old REALITY servers reject the first X25519MLKEM768 hello; the client then
-	// switches to the classic one (TestVLESSRealityXrayHelloFallback).
-	warmCtx, warmCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if conn, err := out.DialContext(warmCtx, vmessInteropMetadata(t, tcpEcho)); err == nil {
-		_ = conn.Close()
-	}
-	warmCancel()
+			// Old REALITY servers reject the first X25519MLKEM768 hello; the client then
+			// switches to the classic one (TestVLESSRealityXrayHelloFallback).
+			warmCtx, warmCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if conn, err := out.DialContext(warmCtx, vmessInteropMetadata(t, tcpEcho)); err == nil {
+				_ = conn.Close()
+			}
+			warmCancel()
 
-	t.Run("tcp", func(t *testing.T) {
-		var wg sync.WaitGroup
-		errs := make(chan error, 16)
-		for i := 0; i < 16; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
+			t.Run("tcp", func(t *testing.T) {
+				var wg sync.WaitGroup
+				errs := make(chan error, 16)
+				for i := 0; i < 16; i++ {
+					wg.Add(1)
+					go func(i int) {
+						defer wg.Done()
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						defer cancel()
+						conn, err := out.DialContext(ctx, vmessInteropMetadata(t, tcpEcho))
+						if err != nil {
+							errs <- err
+							return
+						}
+						defer conn.Close()
+						_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+						payload := bytes.Repeat([]byte{byte(i)}, 64*1024)
+						go func() { _, _ = conn.Write(payload) }()
+						got := make([]byte, len(payload))
+						if _, err := io.ReadFull(conn, got); err != nil {
+							errs <- err
+							return
+						}
+						if !bytes.Equal(got, payload) {
+							errs <- fmt.Errorf("stream %d: echo mismatch", i)
+						}
+					}(i)
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					require.NoError(t, err)
+				}
+			})
+
+			t.Run("udp", func(t *testing.T) {
+				metadata := vmessInteropMetadata(t, udpEcho)
+				metadata.NetWork = C.UDP
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				conn, err := out.DialContext(ctx, vmessInteropMetadata(t, tcpEcho))
-				if err != nil {
-					errs <- err
-					return
+				pc, err := out.ListenPacketContext(ctx, metadata)
+				require.NoError(t, err)
+				defer pc.Close()
+				_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
+				addr := net.UDPAddrFromAddrPort(metadata.AddrPort())
+				buf := make([]byte, 2048)
+				for i := 0; i < 8; i++ {
+					payload := []byte(fmt.Sprintf("xudp-%d", i))
+					_, err = pc.WriteTo(payload, addr)
+					require.NoError(t, err)
+					n, _, err := pc.ReadFrom(buf)
+					require.NoError(t, err)
+					require.Equal(t, payload, buf[:n])
 				}
-				defer conn.Close()
-				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-				payload := bytes.Repeat([]byte{byte(i)}, 64*1024)
-				go func() { _, _ = conn.Write(payload) }()
-				got := make([]byte, len(payload))
-				if _, err := io.ReadFull(conn, got); err != nil {
-					errs <- err
-					return
-				}
-				if !bytes.Equal(got, payload) {
-					errs <- fmt.Errorf("stream %d: echo mismatch", i)
-				}
-			}(i)
-		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			require.NoError(t, err)
-		}
-	})
-
-	t.Run("udp", func(t *testing.T) {
-		metadata := vmessInteropMetadata(t, udpEcho)
-		metadata.NetWork = C.UDP
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		pc, err := out.ListenPacketContext(ctx, metadata)
-		require.NoError(t, err)
-		defer pc.Close()
-		_ = pc.SetDeadline(time.Now().Add(5 * time.Second))
-		addr := net.UDPAddrFromAddrPort(metadata.AddrPort())
-		buf := make([]byte, 2048)
-		for i := 0; i < 8; i++ {
-			payload := []byte(fmt.Sprintf("xudp-%d", i))
-			_, err = pc.WriteTo(payload, addr)
-			require.NoError(t, err)
-			n, _, err := pc.ReadFrom(buf)
-			require.NoError(t, err)
-			require.Equal(t, payload, buf[:n])
-		}
-	})
+			})
+		})
+	}
 }
 
 func startMuxCoolUDPEcho(t *testing.T) string {
