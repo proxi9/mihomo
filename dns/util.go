@@ -427,12 +427,17 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 		fast.Go(func() (*D.Msg, error) {
 			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
 			m, err := client.ExchangeContext(ctx, m)
-			if err != nil {
-				return nil, err
-			} else if cache && (m.Rcode == D.RcodeServerFailure || m.Rcode == D.RcodeRefused) {
+			if err == nil && cache && (m.Rcode == D.RcodeServerFailure || m.Rcode == D.RcodeRefused) {
 				// currently, cache indicates whether this msg was from a RCode client,
 				// so we would ignore RCode errors from RCode clients.
-				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
+				err = errors.New("server failure: " + D.RcodeToString[m.Rcode])
+			}
+			if err != nil {
+				// Canceled means another nameserver has already answered.
+				if !errors.Is(err, context.Canceled) {
+					log.Debugln("[DNS] %s failed: %v", client.Address(), err)
+				}
+				return nil, err
 			}
 			log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
 			return m, nil
